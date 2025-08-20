@@ -1,0 +1,28 @@
+name: Firebase Hosting
+
+on:
+  push:
+    branches:
+      - main  # Triggers the deployment when you push to the 'main' branch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '14'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Deploy to Firebase Hosting
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}  # Use your GitHub secret here
+        run: |
+          echo "$FIREBASE_SERVICE_ACCOUNT" > "$HOME/.firebase-service-account.json"
+          firebase deploy --only hosting --token $(firebase use --token)
