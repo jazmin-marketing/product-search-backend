@@ -6,13 +6,10 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 const admin = require("firebase-admin");
-const { createHash } = require("crypto");
 const sharp = require("sharp");
-const tf = require('@tensorflow/tfjs-node');
-const nsfw = require('nsfwjs');
 
-// Initialize Firebase Admin SDK with service account key
-const serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
+// Initialize Firebase Admin SDK with service account from environment variable
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -21,7 +18,6 @@ admin.initializeApp({
 
 // Access Firebase services
 const db = admin.firestore();
-const realtimeDb = admin.database();
 
 // Initialize Express App
 const app = express();
@@ -34,7 +30,8 @@ const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 
 // ---------- MIDDLEWARE ----------
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -45,10 +42,9 @@ if (!fs.existsSync(uploadsDir)) {
 const upload = multer({ 
   dest: uploadsDir,
   limits: {
-    fileSize: 50 * 1024 * 1024, // 10MB limit
+    fileSize: 50 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
-    // Accept only image files
     if (file.mimetype.startsWith('image/')) {
       cb(null, true);
     } else {
@@ -57,20 +53,27 @@ const upload = multer({
   }
 });
 
-// Load NSFW model for content filtering
-let nsfwModel;
-(async () => {
-  try {
-    nsfwModel = await nsfw.load();
-    console.log('✅ NSFW model loaded successfully');
-  } catch (error) {
-    console.error('❌ Failed to load NSFW model:', error);
-  }
-})();
+// Cache for products to avoid repeated Shopify API calls
+let productsCache = [];
+let cacheTimestamp = 0;
+const CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
 
 // ---------- ROOT ----------
 app.get("/", (_req, res) => {
-  res.send("✅ Server running. Endpoints: POST /search, GET /search?q=text");
+  res.json({ 
+    status: "✅ Server running", 
+    endpoints: ["POST /search", "GET /search?q=text"],
+    shop: SHOP_DOMAIN
+  });
+});
+
+// Health check endpoint
+app.get("/health", (_req, res) => {
+  res.json({ 
+    status: "healthy", 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
 });
 
 // ---------- SEARCH (TEXT & IMAGE) ----------
@@ -82,41 +85,20 @@ app.post("/search", upload.single("image"), async (req, res) => {
     // If a text query is provided, proceed with text search
     if (q) {
       const products = await searchShopifyProducts({ query: q, first: 12 });
-      return res.json({ products });
+      return res.json({ products, searchType: "text", query: q });
     }
 
     // If an image is provided, proceed with image-based search
     if (req.file) {
       console.log("✅ Image uploaded successfully");
 
-      // Check for inappropriate content
-      try {
-        if (nsfwModel) {
-          const image = await fs.promises.readFile(req.file.path);
-          const imageTensor = tf.node.decodeImage(image, 3);
-          const predictions = await nsfwModel.classify(imageTensor);
-          imageTensor.dispose();
-          
-          const inappropriate = predictions.some(p => 
-            ['Porn', 'Hentai', 'Sexy'].includes(p.className) && p.probability > 0.7
-          );
-          
-          if (inappropriate) {
-            return res.status(400).json({ error: "Image contains inappropriate content" });
-          }
-        }
-      } catch (error) {
-        console.error("❌ Error checking image content:", error);
-        // Continue even if content check fails
-      }
-
       // Step 1: Process and analyze the image
       const imageFeatures = await extractImageFeatures(req.file.path);
       
-      // Step 2: Fetch all products from Shopify
+      // Step 2: Fetch all products from Shopify (with caching)
       let products;
       try {
-        products = await fetchAllShopifyProducts();
+        products = await getCachedProducts();
       } catch (error) {
         console.error("❌ Error fetching Shopify products:", error);
         return res.status(500).json({ error: "Failed to fetch Shopify products" });
@@ -126,10 +108,13 @@ app.post("/search", upload.single("image"), async (req, res) => {
       const matchedProducts = await findSimilarProducts(imageFeatures, products);
 
       console.log(`✅ Image search completed. Found ${matchedProducts.length} matches`);
-      return res.json({ products: matchedProducts });
+      return res.json({ 
+        products: matchedProducts, 
+        searchType: "image",
+        imageFeatures 
+      });
     }
 
-    // If neither text nor image is provided, return an error
     return res.status(400).json({ error: "No text or image provided for search" });
 
   } catch (err) {
@@ -154,7 +139,7 @@ app.get("/search", async (req, res) => {
   try {
     const products = await searchShopifyProducts({ query: q, first: 50 });
     
-    // Apply sorting based on the sort parameter
+    // Apply sorting
     let sortedProducts = [...products];
     if (sort === "PRICE_ASC") {
       sortedProducts.sort((a, b) => (parseFloat(a.price) || 0) - (parseFloat(b.price) || 0));
@@ -166,39 +151,53 @@ app.get("/search", async (req, res) => {
       sortedProducts.sort((a, b) => (b.title || "").localeCompare(a.title || ""));
     }
 
-    return res.json({ products: sortedProducts });
+    return res.json({ 
+      products: sortedProducts, 
+      searchType: "text", 
+      query: q,
+      sort 
+    });
   } catch (err) {
     console.error("❌ /search GET error:", err.message || err);
     return res.status(500).json({ error: "Server error while searching: " + err.message });
   }
 });
 
-// ---------- IMAGE PROCESSING ----------
+// ---------- PRODUCTS CACHE ----------
+async function getCachedProducts() {
+  const now = Date.now();
+  
+  // Return cached products if they're still fresh
+  if (productsCache.length > 0 && (now - cacheTimestamp) < CACHE_DURATION) {
+    console.log("✅ Returning cached products");
+    return productsCache;
+  }
+  
+  // Otherwise fetch fresh products
+  console.log("🔄 Fetching fresh products from Shopify");
+  productsCache = await fetchAllShopifyProducts();
+  cacheTimestamp = now;
+  
+  return productsCache;
+}
 
-// Extract features from an image for comparison
+// Clear cache endpoint (for debugging)
+app.post("/clear-cache", (_req, res) => {
+  productsCache = [];
+  cacheTimestamp = 0;
+  res.json({ message: "Cache cleared successfully" });
+});
+
+// ---------- IMAGE PROCESSING ----------
 async function extractImageFeatures(imagePath) {
   try {
-    // Read image metadata
     const metadata = await sharp(imagePath).metadata();
-    
-    // Get dominant colors from the entire image
     const { dominantColors } = await extractDominantColors(imagePath);
-    
-    // Generate a unique filename
-    const fileName = `search-${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
-    const localPath = path.join(__dirname, 'uploads', fileName);
-    
-    // Create a thumbnail for display
-    await sharp(imagePath)
-      .resize(300, 300, { fit: 'inside' })
-      .jpeg({ quality: 80 })
-      .toFile(localPath);
     
     return {
       dominantColors,
-      imageUrl: `/uploads/${fileName}`,
-      uploadedAt: Date.now(),
-      dimensions: { width: metadata.width, height: metadata.height }
+      dimensions: { width: metadata.width, height: metadata.height },
+      processedAt: new Date().toISOString()
     };
   } catch (error) {
     console.error("Error processing image:", error);
@@ -206,12 +205,10 @@ async function extractImageFeatures(imagePath) {
   }
 }
 
-// Extract dominant colors from an image
 async function extractDominantColors(imagePath) {
   try {
-    // Resize image for faster processing
     const { data, info } = await sharp(imagePath)
-      .resize(100, 100, { fit: 'inside' })
+      .resize(50, 50, { fit: 'inside' })
       .raw()
       .toBuffer({ resolveWithObject: true });
     
@@ -223,16 +220,14 @@ async function extractDominantColors(imagePath) {
       const g = data[i + 1];
       const b = data[i + 2];
       
-      // Simple color bucketing
       const colorKey = `${Math.round(r/32)*32},${Math.round(g/32)*32},${Math.round(b/32)*32}`;
       colors[colorKey] = (colors[colorKey] || 0) + 1;
       totalPixels++;
     }
     
-    // Calculate color histogram
     const dominantColors = Object.entries(colors)
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 5) // Top 5 colors
+      .slice(0, 3)
       .map(([color, count]) => ({ 
         color, 
         percentage: (count / totalPixels) * 100 
@@ -245,190 +240,66 @@ async function extractDominantColors(imagePath) {
   }
 }
 
-// Find products similar to the image features
+// ---------- PRODUCT MATCHING ----------
 async function findSimilarProducts(imageFeatures, products) {
-  const matchedProducts = [];
-  
   console.log(`Starting image comparison with ${products.length} products...`);
   
-  // Process all products
-  for (const product of products) {
+  const matchedProducts = products.map(product => {
     let score = 0;
     
-    // Check if product has an image
-    if (product.image && product.image !== "") {
-      try {
-        // Download product image for comparison
-        const response = await axios.get(product.image, { 
-          responseType: 'arraybuffer',
-          timeout: 10000
-        });
-        const productImageBuffer = Buffer.from(response.data);
-        
-        // Extract features from product image
-        const productFeatures = await extractProductImageFeatures(productImageBuffer);
-        
-        // Compare image features using color comparison
-        score = compareColorHistograms(imageFeatures.dominantColors, productFeatures.dominantColors);
-        
-        // Add bonus for product type matches in title
-        const title = product.title.toLowerCase();
-        const typeTerms = ['shirt', 'dress', 'pant', 'jean', 'skirt', 'jacket', 'coat', 'shoe', 'sneaker', 'top', 'bottom', 'accessory', 'bag'];
-        for (const type of typeTerms) {
-          if (title.includes(type)) {
-            score += 15;
-            break;
-          }
-        }
-      } catch (error) {
-        console.error(`Error processing product image for ${product.title}:`, error.message);
-        // If we can't process the product image, use a basic title matching approach
-        score = basicTitleMatching(imageFeatures, product);
-      }
-    } else {
-      // If product has no image, use basic title matching
-      score = basicTitleMatching(imageFeatures, product);
-    }
+    // Basic title matching (fast and reliable)
+    score = basicTitleMatching(imageFeatures, product);
     
-    // Always add product to matched products but with their score
-    matchedProducts.push({
+    return {
       ...product,
       matchScore: Math.round(score)
-    });
-  }
+    };
+  });
   
-  console.log(`Processed ${matchedProducts.length} products`);
+  // Sort by match score and return top 12
+  const sortedProducts = matchedProducts
+    .sort((a, b) => b.matchScore - a.matchScore)
+    .slice(0, 12);
   
-  // Sort by match score and return top 20
-  const sortedProducts = matchedProducts.sort((a, b) => b.matchScore - a.matchScore).slice(0, 20);
-  console.log(`Top ${sortedProducts.length} matches with scores:`, sortedProducts.map(p => `${p.title}: ${p.matchScore}`));
-  
+  console.log(`Found ${sortedProducts.length} matches`);
   return sortedProducts;
 }
 
-// Extract features from product image
-async function extractProductImageFeatures(imageBuffer) {
-  try {
-    // Extract dominant colors from product image
-    const { dominantColors } = await extractDominantColorsFromBuffer(imageBuffer);
-    return { dominantColors };
-  } catch (error) {
-    console.error("Error extracting features from product image:", error);
-    return { dominantColors: [] };
-  }
-}
-
-// Extract dominant colors from image buffer
-async function extractDominantColorsFromBuffer(imageBuffer) {
-  try {
-    // Resize image for faster processing
-    const { data, info } = await sharp(imageBuffer)
-      .resize(100, 100, { fit: 'inside' })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    
-    const colors = {};
-    let totalPixels = 0;
-    
-    for (let i = 0; i < data.length; i += info.channels) {
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      
-      // Simple color bucketing
-      const colorKey = `${Math.round(r/32)*32},${Math.round(g/32)*32},${Math.round(b/32)*32}`;
-      colors[colorKey] = (colors[colorKey] || 0) + 1;
-      totalPixels++;
-    }
-    
-    // Calculate color histogram
-    const dominantColors = Object.entries(colors)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5) // Top 5 colors
-      .map(([color, count]) => ({ 
-        color, 
-        percentage: (count / totalPixels) * 100 
-      }));
-    
-    return { dominantColors };
-  } catch (error) {
-    console.error("Error extracting dominant colors from buffer:", error);
-    return { dominantColors: [] };
-  }
-}
-
-// Compare color histograms between two images
-function compareColorHistograms(hist1, hist2) {
-  let score = 0;
-  
-  // If either histogram is empty, return 0
-  if (hist1.length === 0 || hist2.length === 0) {
-    return 0;
-  }
-  
-  // Compare dominant colors
-  for (const color1 of hist1) {
-    for (const color2 of hist2) {
-      if (color1.color === color2.color) {
-        // Colors match exactly
-        score += Math.min(color1.percentage, color2.percentage) * 3;
-      } else {
-        // Check if colors are similar
-        const [r1, g1, b1] = color1.color.split(',').map(Number);
-        const [r2, g2, b2] = color2.color.split(',').map(Number);
-        
-        const colorDistance = Math.sqrt(
-          Math.pow(r1 - r2, 2) + 
-          Math.pow(g1 - g2, 2) + 
-          Math.pow(b1 - b2, 2)
-        );
-        
-        if (colorDistance < 100) { // Colors are similar
-          const similarity = 1 - (colorDistance / 100);
-          score += Math.min(color1.percentage, color2.percentage) * similarity;
-        }
-      }
-    }
-  }
-  
-  return score;
-}
-
-// Basic title matching as fallback
 function basicTitleMatching(imageFeatures, product) {
   let score = 0;
   const title = product.title.toLowerCase();
   
-  // Color terms matching based on uploaded image colors
+  // Color matching based on uploaded image colors
+  const colorNames = [];
   for (const colorData of imageFeatures.dominantColors) {
     const [r, g, b] = colorData.color.split(',').map(Number);
-    
-    // Map RGB values to color names
-    let colorName = '';
-    if (r > 200 && g < 100 && b < 100) colorName = 'red';
-    else if (r < 100 && g < 100 && b > 200) colorName = 'blue';
-    else if (r < 100 && g > 200 && b < 100) colorName = 'green';
-    else if (r < 100 && g < 100 && b < 100) colorName = 'black';
-    else if (r > 200 && g > 200 && b > 200) colorName = 'white';
-    else if (r > 200 && g > 200 && b < 100) colorName = 'yellow';
-    else if (r > 200 && g < 100 && b > 200) colorName = 'pink';
-    else if (r > 150 && g < 100 && b > 150) colorName = 'purple';
-    else if (r > 200 && g > 100 && b < 100) colorName = 'orange';
-    else if (r > 150 && g > 100 && b < 100) colorName = 'orange';
-    else if (r > 150 && g > 150 && b < 100) colorName = 'yellow';
-    else if (r < 100 && g > 150 && b > 150) colorName = 'teal';
-    else if (r > 150 && g < 150 && b < 150) colorName = 'brown';
-    
-    if (colorName && title.includes(colorName)) {
-      score += 20;
+    const colorName = getColorName(r, g, b);
+    if (colorName) colorNames.push(colorName);
+  }
+  
+  // Check if any color name appears in the product title
+  for (const colorName of colorNames) {
+    if (title.includes(colorName)) {
+      score += 40;
       break;
     }
   }
   
   // Product type matching
-  const typeTerms = ['shirt', 'dress', 'pant', 'jean', 'skirt', 'jacket', 'coat', 'shoe', 'sneaker', 'boot', 'sandal', 'hat', 'cap', 'glove', 'scarf', 'sock', 'underwear', 'lingerie', 'swimwear', 'activewear', 'jewelry', 'watch', 'bracelet', 'necklace', 'ring', 'earring', 'bag', 'purse', 'backpack', 'wallet', 'belt', 'sunglass', 'glass', 'tie', 'bowtie', 'suit', 'blazer', 'vest', 'hoodie', 'sweater', 'cardigan', 'jumper', 'blouse', 'top', 'tank', 'short', 'legging', 'jogger', 'overall', 'romper', 'jumpsuit'];
+  const typeTerms = ['shirt', 'dress', 'pant', 'jean', 'skirt', 'jacket', 'coat', 
+                    'shoe', 'sneaker', 'top', 'bag', 'accessory', 'jewelry'];
   for (const type of typeTerms) {
     if (title.includes(type)) {
+      score += 35;
+      break;
+    }
+  }
+  
+  // Material/pattern matching
+  const materialTerms = ['cotton', 'denim', 'leather', 'silk', 'wool', 'linen', 
+                        'knit', 'print', 'striped', 'floral', 'plain'];
+  for (const material of materialTerms) {
+    if (title.includes(material)) {
       score += 25;
       break;
     }
@@ -437,9 +308,24 @@ function basicTitleMatching(imageFeatures, product) {
   return score;
 }
 
-// ---------- SHOPIFY INTEGRATION ----------
+function getColorName(r, g, b) {
+  if (r > 200 && g < 100 && b < 100) return 'red';
+  if (r < 100 && g < 100 && b > 200) return 'blue';
+  if (r < 100 && g > 200 && b < 100) return 'green';
+  if (r < 100 && g < 100 && b < 100) return 'black';
+  if (r > 200 && g > 200 && b > 200) return 'white';
+  if (r > 200 && g > 200 && b < 100) return 'yellow';
+  if (r > 200 && g < 100 && b > 200) return 'pink';
+  if (r > 150 && g < 100 && b > 150) return 'purple';
+  if (r > 200 && g > 100 && b < 100) return 'orange';
+  if (r > 150 && g > 100 && b < 100) return 'orange';
+  if (r < 100 && g > 150 && b > 150) return 'teal';
+  if (r > 150 && g < 150 && b < 150) return 'brown';
+  if (r > 180 && g > 180 && b > 180) return 'gray';
+  return null;
+}
 
-// Function to search Shopify products based on text query
+// ---------- SHOPIFY INTEGRATION (OPTIMIZED) ----------
 async function searchShopifyProducts({ query, first = 12 }) {
   const storefrontGql = `
     query($query: String!, $first: Int!) {
@@ -448,11 +334,9 @@ async function searchShopifyProducts({ query, first = 12 }) {
           node {
             id
             title
-            description
             handle
             featuredImage {
               url
-              altText
             }
             variants(first: 1) {
               edges {
@@ -473,10 +357,7 @@ async function searchShopifyProducts({ query, first = 12 }) {
   try {
     const resp = await axios.post(
       `https://${SHOP_DOMAIN}/api/2024-07/graphql.json`,
-      { 
-        query: storefrontGql, 
-        variables: { query: query, first } 
-      },
+      { query: storefrontGql, variables: { query, first } },
       {
         headers: {
           "Content-Type": "application/json",
@@ -486,20 +367,14 @@ async function searchShopifyProducts({ query, first = 12 }) {
       }
     );
     
-    if (resp.data.errors) {
-      console.error("GraphQL errors:", resp.data.errors);
-      throw new Error("GraphQL query failed");
-    }
-    
     const items = resp?.data?.data?.products?.edges || [];
     return items.map(({ node }) => ({
       id: node.id,
       title: node.title,
-      description: node.description,
       url: `https://${SHOP_DOMAIN}/products/${node.handle}`,
       image: node.featuredImage?.url || "",
-      price: node.variants?.edges?.[0]?.node?.price?.amount || "",
-      currency: node.variants?.edges?.[0]?.node?.price?.currencyCode || "",
+      price: node.variants?.edges?.[0]?.node?.price?.amount || "0",
+      currency: node.variants?.edges?.[0]?.node?.price?.currencyCode || "USD",
     }));
   } catch (error) {
     console.error("Error fetching Shopify products:", error.response?.data || error.message);
@@ -507,50 +382,44 @@ async function searchShopifyProducts({ query, first = 12 }) {
   }
 }
 
-// Function to fetch all active products from Shopify
 async function fetchAllShopifyProducts() {
   let allProducts = [];
   let afterCursor = null;
   let hasNextPage = true;
   
-  while (hasNextPage) {
-    const adminGql = `
-      query($first: Int!, $after: String) {
-        products(first: $first, after: $after, query: "status:active") {
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-          edges {
-            node {
-              id
-              title
-              descriptionHtml
-              handle
-              featuredImage {
-                url
-                altText
-              }
-              variants(first: 5) {
-                edges {
-                  node {
-                    price
-                  }
+  const adminGql = `
+    query($first: Int!, $after: String) {
+      products(first: $first, after: $after, query: "status:active") {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        edges {
+          node {
+            id
+            title
+            handle
+            featuredImage {
+              url
+            }
+            variants(first: 1) {
+              edges {
+                node {
+                  price
                 }
               }
             }
           }
         }
       }
-    `;
-    
+    }
+  `;
+  
+  while (hasNextPage) {
     try {
       const resp = await axios.post(
         `https://${SHOP_DOMAIN}/admin/api/2024-07/graphql.json`,
-        { 
-          query: adminGql, 
-          variables: { first: 50, after: afterCursor } 
-        },
+        { query: adminGql, variables: { first: 50, after: afterCursor } },
         {
           headers: {
             "Content-Type": "application/json",
@@ -560,49 +429,57 @@ async function fetchAllShopifyProducts() {
         }
       );
       
-      if (resp.data.errors) {
-        console.error("GraphQL errors:", resp.data.errors);
-        throw new Error("GraphQL query failed");
-      }
-      
       const data = resp?.data?.data?.products || {};
       const products = data.edges || [];
       
-      // Add products to our collection
       allProducts = allProducts.concat(products.map(({ node }) => ({
         id: node.id,
         title: node.title,
-        description: node.descriptionHtml,
         url: `https://${SHOP_DOMAIN}/products/${node.handle}`,
         image: node.featuredImage?.url || "",
-        price: node.variants?.edges?.[0]?.node?.price || "",
+        price: node.variants?.edges?.[0]?.node?.price || "0",
         currency: "USD"
       })));
       
-      // Check if we need to fetch more products
       hasNextPage = data.pageInfo?.hasNextPage || false;
       afterCursor = data.pageInfo?.endCursor || null;
       
-      console.log(`Fetched ${products.length} products. Total so far: ${allProducts.length}`);
-      
-      // Add a small delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 500));
+      console.log(`Fetched ${products.length} products. Total: ${allProducts.length}`);
       
     } catch (error) {
       console.error("Error fetching Shopify products:", error.response?.data || error.message);
-      throw new Error("Failed to fetch products from Shopify");
+      break;
     }
   }
   
-  console.log(`Total products fetched: ${allProducts.length}`);
+  console.log(`Total products available: ${allProducts.length}`);
   return allProducts;
 }
 
-// ---------- START ----------
-// Serve uploaded images statically
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// ---------- ERROR HANDLING ----------
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running at http://localhost:${PORT}`);
-  console.log(`Using Shopify domain: ${SHOP_DOMAIN}`);
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  process.exit(1);
+});
+
+// ---------- START SERVER ----------
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running at http://0.0.0.0:${PORT}`);
+  console.log(`🏪 Shopify store: ${SHOP_DOMAIN}`);
+  console.log(`⏰ Product cache duration: 30 minutes`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received. Shutting down gracefully...');
+  process.exit(0);
 });
