@@ -2,9 +2,10 @@ name: Firebase Hosting Deployment
 
 on:
   push:
-    branches:
-      - main
-      workflow_dispatch:
+    branches: [main]
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight UTC
+  workflow_dispatch: # Allows manual triggering
 
 jobs:
   deploy:
@@ -25,24 +26,37 @@ jobs:
       - name: Install Firebase CLI
         run: npm install -g firebase-tools
 
-      - name: Build application (if needed)
-        run: npm run build || echo "No build script found, skipping build"
+      - name: Check for build script
+        id: check-build
+        run: |
+          if [ -f package.json ] && grep -q '"build"' package.json; then
+            echo "BUILD_SCRIPT_EXISTS=true" >> $GITHUB_OUTPUT
+          else
+            echo "BUILD_SCRIPT_EXISTS=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build application (if build script exists)
+        if: steps.check-build.outputs.BUILD_SCRIPT_EXISTS == 'true'
+        run: npm run build
+
+      - name: Set up Firebase Service Account
+        run: |
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' > service-account-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=service-account-key.json" >> $GITHUB_ENV
 
       - name: Deploy to Firebase
         env:
-          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+          PORT: ${{ secrets.PORT }}
+          SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SHOPIFY_ADMIN_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
         run: |
-          # Set environment variables (optional - only if needed during build)
-          echo "PORT=${{ secrets.PORT }}" >> $GITHUB_ENV
-          echo "SHOPIFY_STORE_DOMAIN=${{ secrets.SHOPIFY_STORE_DOMAIN }}" >> $GITHUB_ENV
-          echo "SHOPIFY_ACCESS_TOKEN=${{ secrets.SHOPIFY_ACCESS_TOKEN }}" >> $GITHUB_ENV
-          echo "SHOPIFY_ADMIN_ACCESS_TOKEN=${{ secrets.SHOPIFY_ADMIN_ACCESS_TOKEN }}" >> $GITHUB_ENV
-          echo "FIREBASE_DATABASE_URL=${{ secrets.FIREBASE_DATABASE_URL }}" >> $GITHUB_ENV
-          echo "FIREBASE_STORAGE_BUCKET=${{ secrets.FIREBASE_STORAGE_BUCKET }}" >> $GITHUB_ENV
-          
-          # Verify Firebase configuration exists
-          echo "Checking for firebase.json..."
+          echo "📦 Environment variables set"
+          echo "📁 Directory contents:"
           ls -la
-          
-          # Deploy to Firebase Hosting
-          firebase deploy --only hosting --token "$FIREBASE_TOKEN" --non-interactive1
+          echo "🔥 Deploying to Firebase..."
+          firebase deploy --only hosting --non-interactive
+          echo "✅ Deployment completed!"
+          echo "🌐 Your site is live at: https://jazmin-search-94c89.web.app"
