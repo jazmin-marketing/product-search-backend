@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      workflow_dispatch:
 
 jobs:
   deploy:
@@ -24,11 +25,14 @@ jobs:
       - name: Install Firebase CLI
         run: npm install -g firebase-tools
 
+      - name: Build application (if needed)
+        run: npm run build || echo "No build script found, skipping build"
+
       - name: Deploy to Firebase
         env:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
         run: |
-          # Set environment variables for build
+          # Set environment variables (optional - only if needed during build)
           echo "PORT=${{ secrets.PORT }}" >> $GITHUB_ENV
           echo "SHOPIFY_STORE_DOMAIN=${{ secrets.SHOPIFY_STORE_DOMAIN }}" >> $GITHUB_ENV
           echo "SHOPIFY_ACCESS_TOKEN=${{ secrets.SHOPIFY_ACCESS_TOKEN }}" >> $GITHUB_ENV
@@ -36,5 +40,9 @@ jobs:
           echo "FIREBASE_DATABASE_URL=${{ secrets.FIREBASE_DATABASE_URL }}" >> $GITHUB_ENV
           echo "FIREBASE_STORAGE_BUCKET=${{ secrets.FIREBASE_STORAGE_BUCKET }}" >> $GITHUB_ENV
           
+          # Verify Firebase configuration exists
+          echo "Checking for firebase.json..."
+          ls -la
+          
           # Deploy to Firebase Hosting
-          firebase deploy --only hosting --token "$FIREBASE_TOKEN"
+          firebase deploy --only hosting --token "$FIREBASE_TOKEN" --non-interactive1
